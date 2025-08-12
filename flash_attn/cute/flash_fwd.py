@@ -945,6 +945,105 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # if const_expr(self.num_stages > 1):
         #     load_K_next()
 
+class QKVForwardSm90:
+
+    arch = 90
+
+    def __init__(self, head_dim, dtype):
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.m_block_size = 128
+        self.n_block_size = 128
+        self.n_stages = 4
+    
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mO: cute.Tensor
+    ):
+        ##############################
+        # make cute.TiledMma objects #
+        ##############################
+        tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
+            a_dtype = cutlass.BFloat16,
+            b_dtype = cutlass.BFloat16,
+            a_leading_mode = warpgroup.OperandMajorMode.K,
+            b_leading_mode = warpgroup.OperandMajorMode.K,
+            acc_dtype = cutlass.Float32,
+            atom_layout_mnk = (1,1,1), # TODO what do these do
+            tiler_mn = (64, 64),
+        )
+        tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
+            a_dtype = cutlass.BFloat16,
+            b_dtype = cutlass.BFloat16,
+            a_leading_mode = warpgroup.OperandMajorMode.K,
+            b_leading_mode = warpgroup.OperandMajorMode.K,
+            acc_dtype = cutlass.Float32,
+            atom_layout_mnk = (1,1,1), # TODO what do these do
+            tiler_mn = (64, 64),
+            a_source = warpgroup.OperandSource.RMEM
+        )
+
+        self.num_mma_threads = tiled_mma_qk.size
+        self.num_producer_threads = 128
+        self.num_threads = self.num_mma_threads + self.num_producer_threads
+
+        #######################
+        # Shared Memory Setup #
+        #######################
+        
+        # create smem layout atoms
+        sQ_layout_atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(
+                cutlass.utils.LayoutEnum.ROW_MAJOR, self.dtype, self.head_dim
+            ),
+            self.dtype
+        )
+        sK_layout_atom = sQ_layout_atom
+        sV_layout_atom = sQ_layout_atom
+
+       
+        # create smem layouts 
+        self.sQ_layout = cute.tile_to_shape(
+            sQ_layout_atom, (self.m_block_size, self.head_dim), (0, 1)
+        )
+        self.sK_layout = cute.tile_to_shape(
+            sK_layout_atom, (self.n_block_size, self.head_dim, self.n_stages), (0, 1, 2)
+        )
+        self.sV_layout = cute.tile_to_shape(
+            sV_layout_atom, (self.n_block_size, self.head_dim, self.n_stages), (0, 1, 2)
+        )
+
+        # TODO print total shared memory requirement
+
+        print(f"QKVForwardSm90.__call__")
+
+        self.kernel(mQ, mK, mV, mO).launch(
+            grid=[1,1,1],
+            block=[self.num_threads, 1, 1]
+        )
+    
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mO: cute.Tensor
+    ):
+
+        tidx, _, _ = cute.arch.thread_idx()
+
+        if tidx == 7:
+            cute.printf("hi from thread %d", tidx)
+
+
+
+
+
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 

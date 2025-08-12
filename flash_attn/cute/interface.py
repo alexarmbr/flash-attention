@@ -31,7 +31,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from flash_attn.cute import utils
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90, QKVForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -201,6 +201,70 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = {}
+
+
+def _qkv_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    m_block_size: int = 128,
+    n_block_size: int = 128,
+    num_threads: int = 384,
+):
+    q,k,v = [maybe_contiguous(t) for t in (q,k,v)]
+    batch_size, seq_len, num_head, head_dim = q.shape
+    torch_dtype = q.dtype
+    assert torch_dtype == torch.bfloat16
+    cute_dtype = cutlass.BFloat16
+    device = q.device
+    out = torch.empty_like(q)
+
+    q_tensor, k_tensor, v_tensor, o_tensor = \
+        [from_dlpack(t.detach(), assumed_align=16) for t in (q,k,v,out)]
+
+    compile_key = (
+        head_dim,
+        cute_dtype
+    )
+
+    if compile_key not in _qkv_fwd.compile_cache:
+        print(f"compiling")
+        qkv_fwd = QKVForwardSm90(
+            head_dim,
+            cute_dtype
+        )
+        _qkv_fwd.compile_cache[compile_key] = qkv_fwd
+    
+    _qkv_fwd.compile_cache[compile_key](q_tensor, k_tensor, v_tensor, o_tensor)
+
+
+_qkv_fwd.compile_cache = {}
+
+
+class QKVFunc(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor):
+
+        out = _qkv_fwd(
+            q,k,v
+        )
+        ctx.save_for_backward(q,k,v)
+        return out
+
+def qkv_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor
+):
+    QKVFunc.apply(
+        q,k,v
+    )
+
+
 
 
 def _flash_attn_bwd(
