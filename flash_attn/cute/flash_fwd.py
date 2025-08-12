@@ -954,7 +954,7 @@ class QKVForwardSm90:
         self.dtype = dtype
         self.m_block_size = 128
         self.n_block_size = 128
-        self.n_stages = 4
+        self.num_stages = 4
     
     @cute.jit
     def __call__(
@@ -1005,40 +1005,223 @@ class QKVForwardSm90:
         sK_layout_atom = sQ_layout_atom
         sV_layout_atom = sQ_layout_atom
 
-       
         # create smem layouts 
         self.sQ_layout = cute.tile_to_shape(
             sQ_layout_atom, (self.m_block_size, self.head_dim), (0, 1)
         )
         self.sK_layout = cute.tile_to_shape(
-            sK_layout_atom, (self.n_block_size, self.head_dim, self.n_stages), (0, 1, 2)
+            sK_layout_atom, (self.n_block_size, self.head_dim, self.num_stages), (0, 1, 2)
         )
         self.sV_layout = cute.tile_to_shape(
-            sV_layout_atom, (self.n_block_size, self.head_dim, self.n_stages), (0, 1, 2)
+            sV_layout_atom, (self.n_block_size, self.head_dim, self.num_stages), (0, 1, 2)
         )
 
-        # TODO print total shared memory requirement
+        alignment = 128
+        sQ_struct, sK_struct, sV_layout = [cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], alignment]
+            for layout in [self.sQ_layout, self.sK_layout, self.sV_layout]]
 
-        print(f"QKVForwardSm90.__call__")
+        mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1]
+        mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages]
+        mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages]
 
-        self.kernel(mQ, mK, mV, mO).launch(
-            grid=[1,1,1],
-            block=[self.num_threads, 1, 1]
+        @cute.struct
+        class SharedStorage:
+            sQ: sQ_struct
+            sK: sK_struct
+            sV: sV_layout
+            mbar_ptr_Q: mbar_ptr_Q_struct
+            mbar_ptr_K: mbar_ptr_K_struct
+            mbar_ptr_V: mbar_ptr_V_struct
+        
+        gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
+        gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
+        # gmem_tiled_copy_V = cpasync.CopyBulkTensorTileG2SOp()
+        # gmem_tiled_copy_O = cpasync.CopyBulkTensorTileG2SOp()
+
+        self.tma_copy_q_bytes = cute.size_in_bytes(mQ.element_type, cute.select(self.sQ_layout, mode=[0,1]))
+        self.tma_copy_k_bytes = cute.size_in_bytes(mK.element_type, cute.select(self.sK_layout, mode=[0,1]))
+        self.tma_copy_v_bytes = cute.size_in_bytes(mV.element_type, cute.select(self.sV_layout, mode=[0,1]))
+        # self.tma_copy_o_bytes = cute.size_in_bytes(mO.element_type, cute.select(self.sV_layout, mode=[0,1]))
+
+        tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
+            gmem_tiled_copy_Q,
+            mQ,
+            self.sQ_layout,
+            (self.m_block_size, self.head_dim)
+        )
+        tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+            gmem_tiled_copy_KV,
+            mK,
+            cute.select(self.sK_layout, mode=[0,1]),
+            (self.n_block_size, self.head_dim)
+        )
+        tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+            gmem_tiled_copy_KV,
+            mV,
+            cute.select(self.sV_layout, mode=[0,1]),
+            (self.n_block_size, self.head_dim)
+        )
+
+        
+        # Q,K,V are B,H,N,D
+        num_blocks_m = cute.ceil_div(cute.size(mQ.shape[2]), self.m_block_size)
+        num_heads = cute.size(mQ.shape[1])
+        num_batches = cute.size(mQ.shape[0])
+        seqlen_k = cute.size(mK.shape[2])
+        head_dim = cute.size(mQ.shape[3])
+        total_q = cute.size(mQ.shape[2])
+        
+        tile_scheduler_args = TileSchedulerArguments(
+            num_block=num_blocks_m,
+            num_head=num_heads,
+            num_batch=num_batches,
+            seqlen_k=seqlen_k,
+            headdim=head_dim,
+            headdim_v=head_dim,
+            total_q=total_q,
+            block_size=self.m_block_size # TODO
+        )
+        tile_scheduler_params = SingleTileScheduler.to_underlying_arguments(tile_scheduler_args)
+        grid_dim = SingleTileScheduler.get_grid_shape(tile_scheduler_params)
+        smem_size = SharedStorage.size_in_bytes()
+        print(f"smem_size: {smem_size} out of 233472 bytes")
+        print(f"grid dim: {grid_dim}")
+        print(f"num blocks m: {num_blocks_m}")
+
+        self.kernel(
+            tma_tensor_Q, # tma tensor
+            tma_tensor_K, # tma tensor
+            tma_tensor_V, # tma tensor
+            mO, # output tensor
+            tma_atom_Q, # tma atom
+            tma_atom_K, # tma atom
+            tma_atom_V, # tma atom
+            # gmem_tiled_copy_Q, # gmem tiled copy
+            # gmem_tiled_copy_KV, # gmem tiled copy
+            tiled_mma_qk, # tiled mma
+            tiled_mma_pv, # tiled mma
+            SharedStorage, # shared storage
+            tile_scheduler_params, # tile scheduler params
+        ).launch(
+            grid=grid_dim,
+            block=[self.num_threads, 1, 1],
+            smem=smem_size
         )
     
     @cute.kernel
     def kernel(
         self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mO: cute.Tensor
+        tma_tensor_Q: cute.Tensor,
+        tma_tensor_K: cute.Tensor,
+        tma_tensor_V: cute.Tensor,
+        mO: cute.Tensor,
+        tma_atom_Q: cute.CopyAtom,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
+        # gmem_tiled_copy_Q: cute.TiledCopy,
+        # gmem_tiled_copy_KV: cute.TiledCopy,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        SharedStorage: cutlass.Constexpr,
+        tile_scheduler_params: ParamsBase,
     ):
 
         tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if tidx == 7:
             cute.printf("hi from thread %d", tidx)
+        
+        # prefetch tma descriptors
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_Q)
+            cpasync.prefetch_descriptor(tma_atom_K)
+            cpasync.prefetch_descriptor(tma_atom_V)
+        
+        # allocate shared memory
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        mbar_ptr_Q = storage.mbar_ptr_Q.data_ptr()
+        # mbar_ptr_K = storage.mbar_ptr_K.data_ptr()
+        # mbar_ptr_V = storage.mbar_ptr_V.data_ptr()
+
+        # load Q
+        mbar_ptr_Q = storage.mbar_ptr_Q.data_ptr()
+        if warp_idx == 1:
+            cute.arch.mbarrier_init(mbar_ptr_Q, arrival_count=1)
+        
+        # setup pipeline groups
+        num_producer_warpgroups = 1
+        num_consumer_warpgroups = self.num_mma_threads // 128
+        pipeline_kv_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, num_producer_warpgroups)
+        pipeline_kv_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, num_consumer_warpgroups)
+        
+        # setup pipeline objects
+        pipeline_k = pipeline.PipelineTmaAsyncNoCluster.create(
+            barrier_storage=storage.mbar_ptr_Q.data_ptr(),
+            num_stages=self.num_stages,
+            producer_group=pipeline_kv_producer_group,
+            consumer_group=pipeline_kv_consumer_group,
+            tx_count=self.tma_copy_k_bytes,
+            init_wait=False,
+        )
+        pipeline_v = pipeline.PipelineTmaAsyncNoCluster.create(
+            barrier_storage=storage.mbar_ptr_V.data_ptr(),
+            num_stages=self.num_stages,
+            producer_group=pipeline_kv_producer_group,
+            consumer_group=pipeline_kv_consumer_group,
+            tx_count=self.tma_copy_v_bytes,
+            init_wait=False,
+        )
+
+        if warp_idx == 0:
+            self.producer(
+                tma_tensor_K,
+                tma_tensor_V,
+                tma_atom_K,
+                tma_atom_V,
+                pipeline_k,
+                pipeline_v,
+            )
+        
+        else:
+            self.consumer(
+                tma_tensor_K,
+                tma_tensor_V,
+                tma_atom_K,
+                tma_atom_V,
+                pipeline_k,
+                pipeline_v
+            )
+
+
+    @cute.jit
+    def producer(self,
+        tma_tensor_K: cute.Tensor,
+        tma_tensor_V: cute.Tensor,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
+        pipeline_k: cutlass.pipeline.PipelineAsync,
+        pipeline_v: cutlass.pipeline.PipelineAsync,
+    ):
+        warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        if warp_idx_in_wg == 0:
+            kv_producer_state = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.num_stages)
+
+
+    @cute.jit
+    def consumer(self,
+        tma_tensor_K: cute.Tensor,
+        tma_tensor_V: cute.Tensor,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
+        pipeline_k: cutlass.pipeline.PipelineAsync,
+        pipeline_v: cutlass.pipeline.PipelineAsync,
+    ):
+        pass
+        
+
+        
 
 
 
@@ -1550,15 +1733,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     mK_cur, mV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[None, None, head_idx_kv]) for t in (mK, mV)]
                 gK = cute.local_tile(mK_cur, (self.n_block_size, self.head_dim_padded), (None, 0))
                 gV = cute.local_tile(mV_cur, (self.n_block_size, self.head_dim_v_padded), (None, 0))
-                if const_expr(not self.pack_gqa):
-                    gQ = cute.local_tile(mQ_cur, (self.m_block_size, self.head_dim_padded), (m_block, 0))
-                    tQsQ, tQgQ = cpasync.tma_partition(
-                        tma_atom_Q,
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(sQ, 0, 2),
-                        cute.group_modes(gQ, 0, 2),
-                    )
+                # if const_expr(not self.pack_gqa):
+                #     gQ = cute.local_tile(mQ_cur, (self.m_block_size, self.head_dim_padded), (m_block, 0))
+                #     tQsQ, tQgQ = cpasync.tma_partition(
+                #         tma_atom_Q,
+                #         0,
+                #         cute.make_layout(1),
+                #         cute.group_modes(sQ, 0, 2),
+                #         cute.group_modes(gQ, 0, 2),
+                #     )
                 tKsK, tKgK = cpasync.tma_partition(
                     tma_atom_K,
                     0,
@@ -1576,12 +1759,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 load_K = partial(self.load_K, tma_atom_K, tKgK, tKsK, pipeline_k)
                 load_V = partial(self.load_K, tma_atom_V, tVgV, tVsV, pipeline_v)
                 # load_Q
-                if const_expr(not self.pack_gqa):
-                    # TODO: wait for Q to be empty
-                    q_producer_phase ^= 1
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_q_bytes)
-                    cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=mbar_ptr_Q)
+                # if const_expr(not self.pack_gqa):
+                #     # TODO: wait for Q to be empty
+                #     q_producer_phase ^= 1
+                #     with cute.arch.elect_one():
+                #         cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_q_bytes)
+                #     cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=mbar_ptr_Q)
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
                 # if cute.arch.thread_idx()[0] == 0:
                 #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
