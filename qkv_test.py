@@ -14,7 +14,7 @@ def test_qkv():
 
     torch.manual_seed(0)
     device = "cuda"
-    dtype = torch.bfloat16
+    dtype = torch.float16
 
     # Problem sizes (bf16, non-causal)
     batch_size = 2
@@ -24,9 +24,12 @@ def test_qkv():
 
     # Create Q/K/V in (B,H, S, D)
     with torch.inference_mode():
-        q = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
-        k = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
-        v = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        # q = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        # k = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        # v = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        q = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype) * 3
+        k = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        v = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
         out = qkv_func(q,k,v)
 
         # sychronize and check for cuda errors

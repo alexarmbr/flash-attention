@@ -214,8 +214,8 @@ def _qkv_fwd(
     q,k,v = [maybe_contiguous(t) for t in (q,k,v)]
     batch_size, seq_len, num_head, head_dim = q.shape
     torch_dtype = q.dtype
-    assert torch_dtype == torch.bfloat16
-    cute_dtype = cutlass.BFloat16
+    assert torch_dtype in [torch.float16, torch.bfloat16]
+    cute_dtype = torch2cute_dtype_map[torch_dtype]
     device = q.device
     out = torch.empty_like(q)
 

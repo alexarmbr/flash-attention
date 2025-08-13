@@ -1017,7 +1017,7 @@ class QKVForwardSm90:
         ) # S<2,4,3> o 0 o ((8,16),(32,1),(1,4)):((32,256),(1,0),(0,4096)) -> swizzle_func o (BN, head_dim, num_stages)
 
         alignment = 128
-        sQ_struct, sK_struct, sV_layout = [cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], alignment]
+        sQ_struct, sK_struct, sV_struct = [cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], alignment]
             for layout in [self.sQ_layout, self.sK_layout, self.sV_layout]]
 
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 2]
@@ -1028,7 +1028,7 @@ class QKVForwardSm90:
         class SharedStorage:
             sQ: sQ_struct
             sK: sK_struct
-            sV: sV_layout
+            sV: sV_struct
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
@@ -1091,6 +1091,7 @@ class QKVForwardSm90:
         print(f"grid dim: {grid_dim}")
         print(f"num blocks m: {num_blocks_m}")
         print(f"block dim: {block_dim}")
+        print(f"tma copy q bytes: {self.tma_copy_q_bytes}")
 
         self.kernel(
             tma_tensor_Q, # tma tensor
@@ -1139,12 +1140,14 @@ class QKVForwardSm90:
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        is_producer = warp_idx < 4
         
         # prefetch tma descriptors
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_Q)
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
+        cute.arch.sync_threads()
         
         # allocate shared memory
         smem = cutlass.utils.SmemAllocator()
@@ -1159,6 +1162,8 @@ class QKVForwardSm90:
         mbar_ptr_Q = storage.mbar_ptr_Q.data_ptr()
         with cute.arch.elect_one():
             cute.arch.mbarrier_init(mbar_ptr_Q, cnt=1)
+        cute.arch.mbarrier_init_fence()
+        cute.arch.sync_threads()
         
         # setup pipeline groups
         num_producer_warpgroups = 1
@@ -1186,7 +1191,7 @@ class QKVForwardSm90:
 
         TileSchedulerCls = partial(SingleTileScheduler.create, tile_scheduler_params)
 
-        if warp_idx == 0:
+        if is_producer:
             # TODO decrease registers
             self.producer(
                 tma_tensor_Q,
@@ -1208,6 +1213,7 @@ class QKVForwardSm90:
         else:
             self.consumer(
                 mbar_ptr_Q,
+                sQ,
                 # tma_tensor_Q,
                 # tma_tensor_K,
                 # tma_tensor_V,
@@ -1259,7 +1265,7 @@ class QKVForwardSm90:
             tiled_tma_V = cute.local_tile(block_tma_V, tiler=(self.n_block_size, self.head_dim), coord=(None, 0)) # (BN, D, N/BN)
             
             # tile (N, D) by (BM, D) to get (BM, D, N/BM, 1) and then select this thread block's tile, and select out the last singleton dimension
-            tiled_tma_Q = cute.local_tile(block_tma_Q, tiler=(self.m_block_size, self.head_dim), coord=(m_block, 0)) # (BM, D, N/BM)
+            tiled_tma_Q = cute.local_tile(block_tma_Q, tiler=(self.m_block_size, self.head_dim), coord=(m_block, 0)) # (BM, D)
 
             # create TMA partitions, align views of shared memory tiles and global memory tiles
             sQ_grouped = cute.group_modes(sQ, 0, 2) # go from (BM, head_dim) to ((BM, head_dim))
@@ -1310,6 +1316,22 @@ class QKVForwardSm90:
             cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=mbar_ptr_Q)
 
             if block_idx_x == 0 and block_idx_y == 0 and block_idx_z == 0 and thread_idx_x == 0:
+                # cute.printf("tma copy atom Q: {}", str(tma_atom_Q))
+                cute.printf("sQ grouped: {}", sQ_grouped)
+                cute.printf("tiled_tma_Q grouped: {}", tiled_tma_Q_grouped)
+                cute.printf("tiled tma k grouped: {}", tiled_tma_K_grouped)
+                cute.printf("tiled tma v grouped: {}", tiled_tma_V_grouped)
+                cute.printf("sK grouped: {}", sK_grouped)
+                cute.printf("sV grouped: {}", sV_grouped)
+                cute.printf("tQgQ: {}", tQgQ)
+                cute.printf("tQsQ: {}", tQsQ)
+                # cute.printf("tma_Q: {}", tma_Q)
+                # cute.printf("tma_K: {}", tma_K)
+                # cute.printf("tma_V: {}", tma_V)
+                
+                
+                
+                
                 cute.printf("PRODUCER: copy initiated")
 
             # n_blocks = cute.ceil_div(tma_Q.shape[2], self.n_block_size)
@@ -1338,6 +1360,7 @@ class QKVForwardSm90:
     @cute.jit
     def consumer(self,
         mbar_ptr_Q: cute.Pointer,
+        sQ: cute.Tensor,
         # tma_tensor_K: cute.Tensor,
         # tma_tensor_V: cute.Tensor,
         # tma_atom_K: cute.CopyAtom,
@@ -1345,11 +1368,17 @@ class QKVForwardSm90:
         # pipeline_k: cutlass.pipeline.PipelineAsync,
         # pipeline_v: cutlass.pipeline.PipelineAsync,
     ):
-        cute.arch.mbarrier_wait(mbar_ptr_Q, 1)
+        cute.arch.mbarrier_wait(mbar_ptr_Q, 0)
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
-        if tidx == 128 and bidx == 0 and bidy == 0 and bidz == 0:
+        if tidx == 132 and bidx == 0 and bidy == 0 and bidz == 0:
             cute.printf("CONSUMER: Q loaded")
+            # cute.printf("sQ layout: {}", sQ.layout)
+            # cute.print_tensor(sQ)
+
+            # print first 10 elements of sQ
+            # sliced_data = cute.slice_(sQ, (0, None))
+            # cute.print_tensor(sliced_data)
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
@@ -1760,7 +1789,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         if warp_idx < 4:  # Producer
-            cute.arch.warpgroup_reg_dealloc(self.num_producer_regs)
+            # cute.arch.warpgroup_reg_dealloc(self.num_producer_regs)
             self.load(
                 mQ,
                 mK,
@@ -1780,7 +1809,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
 
         else:  # Consumer
-            cute.arch.warpgroup_reg_alloc(self.num_mma_regs)
+            # cute.arch.warpgroup_reg_alloc(self.num_mma_regs)
             # ///////////////////////////////////////////////////////////////////////////////
             # Tile MMA compute thread partitions and allocate accumulators
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1832,6 +1861,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
+        bidx, bidy, bidz = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         if warp_idx_in_wg == 0:
             q_producer_phase = cutlass.Int32(1)
@@ -1866,6 +1897,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         cute.group_modes(sQ, 0, 2),
                         cute.group_modes(gQ, 0, 2),
                     )
+
+                    if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+                        cute.printf("tQsQ: {}", tQsQ.layout)
+                        cute.printf("tQgQ: {}", tQgQ.layout)
+                        # cute.printf("sQ grouped: {}", sQ_grouped)
+                        # cute.printf("tiled_tma_Q grouped: {}", tiled_tma_Q_grouped)
+                        # cute.printf("tiled tma k grouped: {}", tiled_tma_K_grouped)
                 
                 
                 tKsK, tKgK = cpasync.tma_partition(
@@ -1938,6 +1976,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
     ):
+        bidx, bidy, bidz = cute.arch.block_idx()
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
             self.num_mma_warp_groups, stride=self.num_threads_per_warp_group
@@ -2030,6 +2069,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
+
+            # if tidx == 128 and bidx == 0 and bidy == 0 and bidz == 0:
+            #     # cute.printf("sQ layout: {}", sQ.layout)
+            #     cute.print_tensor(sQ)
+
+
             q_consumer_phase ^= 1
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
