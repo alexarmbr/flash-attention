@@ -18,16 +18,19 @@ def test_qkv():
 
     # Problem sizes (bf16, non-causal)
     batch_size = 2
-    seqlen = 4098
+    seqlen = 4096
     nheads = 6
     headdim = 32  # multiple of 8, <= 256
 
-    # Create Q/K/V in (B, S, H, D)
+    # Create Q/K/V in (B,H, S, D)
     with torch.inference_mode():
-        q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-        k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-        v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+        q = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        k = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        v = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
         out = qkv_func(q,k,v)
+
+        # sychronize and check for cuda errors
+        torch.cuda.synchronize()
 
 def main():
     test_qkv()
