@@ -28,8 +28,11 @@ def test_qkv():
         # k = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
         # v = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
         q = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype) * 3
-        k = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
-        v = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        k = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype) * 3
+        v = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype) * 3
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
         out = qkv_func(q,k,v)
 
         # sychronize and check for cuda errors
