@@ -1592,17 +1592,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         else:
             tma_atom_O = None
 
-        print(f"tma_tensor_Q: {tma_tensor_Q}")
-        print(f"tma_tensor_K: {tma_tensor_K}")
-        print(f"tma_tensor_V: {tma_tensor_V}")
-
-        print(f"tma_atom_Q: {tma_atom_Q}")
-        print(f"tma_atom_K: {tma_atom_K}")
-        print(f"tma_atom_V: {tma_atom_V}")
-
-        print(f"sQ_layout: {self.sQ_layout}")
-        print(f"sK_layout: {cute.select(self.sK_layout, mode=[0,1])}")
-        print(f"sV_layout: {cute.select(self.sV_layout, mode=[0,1])}")
         if const_expr(self.pack_gqa):
             shape_Q_packed = ((self.qhead_per_kvhead, mQ.shape[0]), mQ.shape[1], mK.shape[2], *mQ.shape[3:])
             stride_Q_packed = ((mQ.stride[2], mQ.stride[0]), mQ.stride[1], mQ.stride[2] * self.qhead_per_kvhead, *mQ.stride[3:])
@@ -1914,20 +1903,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 
                 if const_expr(not self.pack_gqa):
                     gQ = cute.local_tile(mQ_cur, (self.m_block_size, self.head_dim_padded), (m_block, 0))
+                    gQ_grouped = cute.group_modes(gQ, 0, 2)
+                    sQ_grouped = cute.group_modes(sQ, 0, 2)
                     tQsQ, tQgQ = cpasync.tma_partition(
                         tma_atom_Q,
                         0,
                         cute.make_layout(1),
-                        cute.group_modes(sQ, 0, 2),
-                        cute.group_modes(gQ, 0, 2),
+                        sQ_grouped,
+                        gQ_grouped,
                     )
 
-                    # if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
-                    #     cute.printf("tQsQ: {}", tQsQ)
-                    #     cute.printf("tQgQ: {}", tQgQ)
-                        # cute.printf("sQ grouped: {}", sQ_grouped)
-                        # cute.printf("tiled_tma_Q grouped: {}", tiled_tma_Q_grouped)
-                        # cute.printf("tiled tma k grouped: {}", tiled_tma_K_grouped)
+                    if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+                        cute.printf("gQ: {}", gQ.layout)
+                        cute.printf("gQ_grouped: {}", gQ_grouped.layout)
+                        cute.printf("sQ: {}", sQ.layout)
+                        cute.printf("sQ_grouped: {}", sQ_grouped.layout)
+                        cute.printf("tQgQ: {}", tQgQ.layout)
                 
                 
                 tKsK, tKgK = cpasync.tma_partition(
@@ -1954,11 +1945,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_q_bytes)
                     cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=mbar_ptr_Q)
-
-                    if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
-                        cute.printf("tma q copy bytes: {}", self.tma_copy_q_bytes)
-                        cute.printf("tQsQ: {}", tQsQ)
-                
                 
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
                 # if cute.arch.thread_idx()[0] == 0:
@@ -2097,12 +2083,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
-
-            if tidx == 128 and bidx == 0 and bidy == 0 and bidz == 0:
-                cute.printf("sQ layout: {}", sQ.layout)
-                cute.printf("sQ: {}", sQ)
-                # cute.print_tensor(sQ)
-
+            if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+                cute.printf("sQ[-1]: {}", sQ[(128*32)-1])
 
             q_consumer_phase ^= 1
             # For performance reason, we separate out two kinds of iterations:

@@ -15,7 +15,7 @@ def test_fwd():
 
     torch.manual_seed(0)
     device = "cuda"
-    dtype = torch.bfloat16
+    dtype = torch.float16
 
     # Problem sizes (bf16, non-causal)
     batch_size = 2

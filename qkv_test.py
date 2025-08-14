@@ -19,8 +19,8 @@ def test_qkv():
     # Problem sizes (bf16, non-causal)
     batch_size = 2
     seqlen = 4096
-    nheads = 6
-    headdim = 32  # multiple of 8, <= 256
+    nheads = 32
+    headdim = 64  # multiple of 8, <= 256
 
     # Create Q/K/V in (B,H, S, D)
     with torch.inference_mode():
