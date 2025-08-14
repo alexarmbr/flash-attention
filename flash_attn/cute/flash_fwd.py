@@ -1026,12 +1026,13 @@ class QKVForwardSm90:
 
         @cute.struct
         class SharedStorage:
-            sQ: sQ_struct
-            sK: sK_struct
-            sV: sV_struct
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
+            sQ: sQ_struct
+            sK: sK_struct
+            sV: sV_struct
+
         
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()
@@ -1061,6 +1062,18 @@ class QKVForwardSm90:
             cute.select(self.sV_layout, mode=[0,1]),
             (self.n_block_size, self.head_dim)
         )
+
+        print(f"tma_tensor_Q: {tma_tensor_Q}")
+        print(f"tma_tensor_K: {tma_tensor_K}")
+        print(f"tma_tensor_V: {tma_tensor_V}")
+
+        print(f"tma_atom_Q: {tma_atom_Q}")
+        print(f"tma_atom_K: {tma_atom_K}")
+        print(f"tma_atom_V: {tma_atom_V}")
+
+        print(f"sQ_layout: {self.sQ_layout}")
+        print(f"sK_layout: {cute.select(self.sK_layout, mode=[0,1])}")
+        print(f"sV_layout: {cute.select(self.sV_layout, mode=[0,1])}")
 
         
         # Q,K,V are B,H,N,D
@@ -1317,21 +1330,12 @@ class QKVForwardSm90:
 
             if block_idx_x == 0 and block_idx_y == 0 and block_idx_z == 0 and thread_idx_x == 0:
                 # cute.printf("tma copy atom Q: {}", str(tma_atom_Q))
-                cute.printf("sQ grouped: {}", sQ_grouped)
-                cute.printf("tiled_tma_Q grouped: {}", tiled_tma_Q_grouped)
-                cute.printf("tiled tma k grouped: {}", tiled_tma_K_grouped)
-                cute.printf("tiled tma v grouped: {}", tiled_tma_V_grouped)
-                cute.printf("sK grouped: {}", sK_grouped)
-                cute.printf("sV grouped: {}", sV_grouped)
-                cute.printf("tQgQ: {}", tQgQ)
-                cute.printf("tQsQ: {}", tQsQ)
+                # cute.printf("tma_copy_q_bytes: {}", self.tma_copy_q_bytes)
+                # cute.printf("tQgQ: {}", tQgQ.layout)
+                # cute.printf("tQsQ: {}", tQsQ)
                 # cute.printf("tma_Q: {}", tma_Q)
                 # cute.printf("tma_K: {}", tma_K)
                 # cute.printf("tma_V: {}", tma_V)
-                
-                
-                
-                
                 cute.printf("PRODUCER: copy initiated")
 
             # n_blocks = cute.ceil_div(tma_Q.shape[2], self.n_block_size)
@@ -1374,6 +1378,14 @@ class QKVForwardSm90:
         if tidx == 132 and bidx == 0 and bidy == 0 and bidz == 0:
             cute.printf("CONSUMER: Q loaded")
             # cute.printf("sQ layout: {}", sQ.layout)
+            cute.printf("sQ: {}", sQ[0])
+            cute.printf("sQ: {}", sQ[1])
+            cute.printf("sQ: {}", sQ[2])
+            cute.printf("sQ: {}", sQ[3])
+            cute.printf("sQ: {}", sQ[4])
+            cute.printf("sQ: {}", sQ[5])
+            cute.printf("sQ: {}", sQ[6])
+            cute.printf("sQ: {}", sQ[7])
             # cute.print_tensor(sQ)
 
             # print first 10 elements of sQ
@@ -1579,6 +1591,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         else:
             tma_atom_O = None
+
+        print(f"tma_tensor_Q: {tma_tensor_Q}")
+        print(f"tma_tensor_K: {tma_tensor_K}")
+        print(f"tma_tensor_V: {tma_tensor_V}")
+
+        print(f"tma_atom_Q: {tma_atom_Q}")
+        print(f"tma_atom_K: {tma_atom_K}")
+        print(f"tma_atom_V: {tma_atom_V}")
+
+        print(f"sQ_layout: {self.sQ_layout}")
+        print(f"sK_layout: {cute.select(self.sK_layout, mode=[0,1])}")
+        print(f"sV_layout: {cute.select(self.sV_layout, mode=[0,1])}")
         if const_expr(self.pack_gqa):
             shape_Q_packed = ((self.qhead_per_kvhead, mQ.shape[0]), mQ.shape[1], mK.shape[2], *mQ.shape[3:])
             stride_Q_packed = ((mQ.stride[2], mQ.stride[0]), mQ.stride[1], mQ.stride[2] * self.qhead_per_kvhead, *mQ.stride[3:])
@@ -1898,9 +1922,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         cute.group_modes(gQ, 0, 2),
                     )
 
-                    if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
-                        cute.printf("tQsQ: {}", tQsQ.layout)
-                        cute.printf("tQgQ: {}", tQgQ.layout)
+                    # if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+                    #     cute.printf("tQsQ: {}", tQsQ)
+                    #     cute.printf("tQgQ: {}", tQgQ)
                         # cute.printf("sQ grouped: {}", sQ_grouped)
                         # cute.printf("tiled_tma_Q grouped: {}", tiled_tma_Q_grouped)
                         # cute.printf("tiled tma k grouped: {}", tiled_tma_K_grouped)
@@ -1930,6 +1954,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_q_bytes)
                     cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=mbar_ptr_Q)
+
+                    if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+                        cute.printf("tma q copy bytes: {}", self.tma_copy_q_bytes)
+                        cute.printf("tQsQ: {}", tQsQ)
                 
                 
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
@@ -2070,9 +2098,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
 
-            # if tidx == 128 and bidx == 0 and bidy == 0 and bidz == 0:
-            #     # cute.printf("sQ layout: {}", sQ.layout)
-            #     cute.print_tensor(sQ)
+            if tidx == 128 and bidx == 0 and bidy == 0 and bidz == 0:
+                cute.printf("sQ layout: {}", sQ.layout)
+                cute.printf("sQ: {}", sQ)
+                # cute.print_tensor(sQ)
 
 
             q_consumer_phase ^= 1
