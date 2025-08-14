@@ -13,7 +13,7 @@ import cuda.bindings.driver as cuda
 
 os.environ["CUTE_DSL_ARCH"] = "sm_90a"
 
-class QCopySm90:
+class TmaCopySm90:
     arch = 90
 
     def __init__(self, head_dim, dtype):
@@ -28,24 +28,10 @@ class QCopySm90:
         mQ: cute.Tensor,
         cuda_stream: cuda.CUstream,
     ):
-        # Create a simple tiled_mma to get the correct thread count
-        tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
-            a_dtype=cutlass.Float16,
-            b_dtype=cutlass.Float16,
-            a_leading_mode=warpgroup.OperandMajorMode.K,
-            b_leading_mode=warpgroup.OperandMajorMode.K,
-            acc_dtype=cutlass.Float32,
-            atom_layout_mnk=(1,1,1),
-            tiler_mn=(64, 64),
-        )
+        self.num_threads = 256
         
-        self.num_mma_threads = tiled_mma.size
-        self.num_producer_threads = 128
-        self.num_threads = self.num_mma_threads + self.num_producer_threads
-        
-        
-        # permute mQ from (B,H,N,D) to (H,D,N,B)
-        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[1, 3, 2, 0]))
+        # permute mQ from (B,H,N,D) to (N,D,B,H)
+        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[2,3,0,1]))
         
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
             sm90_utils_basic.get_smem_layout_atom(
@@ -75,8 +61,6 @@ class QCopySm90:
         tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
             gmem_tiled_copy_Q, mQ, cute.select(self.sQ_layout, mode=[0, 1]), (self.m_block_size, self.head_dim)
         )
-        # print(f"Original mQ layout: {mQ.layout}")
-        # print(f"TMA tensor layout: {tma_tensor_Q.layout}")
 
         num_blocks_m = cute.ceil_div(cute.size(mQ.shape[2]), self.m_block_size)  # seqlen dimension
         num_heads = cute.size(mQ.shape[1])
@@ -86,18 +70,6 @@ class QCopySm90:
         grid_dim = (num_blocks_m, num_heads, num_batches)
         block_dim = (self.num_threads, 1, 1)
         smem_size = SharedStorage.size_in_bytes()
-        
-        # (H,D,N,B)
-        
-        # print(f"smem_size: {smem_size} out of 233472 bytes")
-        # print(f"batch size: {cute.size(mQ.shape[3])}")
-        # print(f"num heads: {cute.size(mQ.shape[0])}")
-        # print(f"sequence length: {cute.size(mQ.shape[2])}")
-        # print(f"head dim: {cute.size(mQ.shape[1])}")
-        # print(f"grid dim: {grid_dim}")
-        # print(f"num blocks m: {num_blocks_m}")
-        # print(f"block dim: {block_dim}")
-        # print(f"tma copy q bytes: {self.tma_copy_q_bytes}")
 
         self.kernel(
             tma_tensor_Q,
@@ -147,7 +119,8 @@ class QCopySm90:
                 batch_idx = bidz
 
                 # Extract the 2D slice for this batch and head
-                block_tma_Q = tma_tensor_Q[None, None, head_idx, batch_idx]
+                # block_tma_Q = tma_tensor_Q[None, None, head_idx, batch_idx]
+                block_tma_Q = tma_tensor_Q[None, None, batch_idx, head_idx]
                 tiled_tma_Q = cute.local_tile(
                     block_tma_Q, tiler=(self.m_block_size, self.head_dim), coord=(m_block, 0)
                 )
@@ -185,7 +158,7 @@ class QCopySm90:
             cute.arch.mbarrier_wait(mbar_ptr_Q, 0)
             if tidx == 132 and bidx == 0 and bidy == 0 and bidz == 0:
                 cute.printf("CONSUMER: Q loaded")
-                # cute.print_tensor(sQ)
+                cute.print_tensor(sQ)
 
 
 def main():
@@ -199,7 +172,6 @@ def main():
     device = "cuda"
     torch_dtype = torch.float16
 
-    # Problem sizes
     batch_size = 2
     nheads = 8
     seqlen = 4096
@@ -212,23 +184,15 @@ def main():
         ptr = tensor.data_ptr()
         return ptr % alignment == 0
 
-    # Create Q/K/V in (B,H,N,D)
     with torch.inference_mode():
         q = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=torch_dtype) * 3
-
         q = q.contiguous()
-
-        # Convert to CuTe tensors
-        q_tensor = from_dlpack(q.detach(), assumed_align=16)
-
-        cute_dtype = cutlass.Float16
-
-        # Instantiate and run the minimal kernel (Q→SMEM TMA copy only)
-        kernel = QCopySm90(headdim, cute_dtype)
-        torch.cuda.synchronize()
-
-        kernel = cute.compile(kernel, q_tensor, cuda_stream)
         
+        q_tensor = from_dlpack(q.detach(), assumed_align=16)
+        cute_dtype = cutlass.Float16
+        
+        kernel = TmaCopySm90(headdim, cute_dtype)
+        kernel = cute.compile(kernel, q_tensor, cuda_stream)
         kernel(q_tensor, cuda_stream)
 
         torch.cuda.synchronize()
