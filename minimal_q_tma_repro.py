@@ -31,7 +31,7 @@ class TmaCopySm90:
         self.num_threads = 256
         
         # permute mQ from (B,H,N,D) to (N,D,B,H)
-        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[2,3,0,1]))
+        # mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[2,3,0,1]))
         
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
             sm90_utils_basic.get_smem_layout_atom(
@@ -62,9 +62,15 @@ class TmaCopySm90:
             gmem_tiled_copy_Q, mQ, cute.select(self.sQ_layout, mode=[0, 1]), (self.m_block_size, self.head_dim)
         )
 
+        # num_blocks_m = cute.ceil_div(cute.size(mQ.shape[2]), self.m_block_size)  # seqlen dimension
+        # num_heads = cute.size(mQ.shape[1])
+        # num_batches = cute.size(mQ.shape[3])
+
+        print(f"mQ: {mQ.layout}")
+
         num_blocks_m = cute.ceil_div(cute.size(mQ.shape[2]), self.m_block_size)  # seqlen dimension
         num_heads = cute.size(mQ.shape[1])
-        num_batches = cute.size(mQ.shape[3])
+        num_batches = cute.size(mQ.shape[0])
         
         # Grid: (num_blocks_m, num_heads, num_batches)
         grid_dim = (num_blocks_m, num_heads, num_batches)
@@ -120,7 +126,10 @@ class TmaCopySm90:
 
                 # Extract the 2D slice for this batch and head
                 # block_tma_Q = tma_tensor_Q[None, None, head_idx, batch_idx]
-                block_tma_Q = tma_tensor_Q[None, None, batch_idx, head_idx]
+
+                block_tma_Q = tma_tensor_Q[batch_idx, head_idx, None, None]
+                
+                # block_tma_Q = tma_tensor_Q[None, None, batch_idx, head_idx]
                 tiled_tma_Q = cute.local_tile(
                     block_tma_Q, tiler=(self.m_block_size, self.head_dim), coord=(m_block, 0)
                 )
@@ -137,6 +146,7 @@ class TmaCopySm90:
                 )
 
                 if bidx == 0 and bidy == 0 and bidz == 0 and tidx == 0:
+                    cute.printf("tma_tensor_Q: {}", tma_tensor_Q.layout)
                     cute.printf("gQ: {}", tiled_tma_Q.layout)
                     cute.printf("gQ_grouped: {}", tiled_tma_Q_grouped.layout)
                     cute.printf("sQ: {}", sQ.layout)

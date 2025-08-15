@@ -1,0 +1,4 @@
+- dont change any code without asking me first.
+- before running any python code, source the virtual environment by doing `source /.venv/bin/activate`
+- in order to test code in QKVForwardSm90, you need to run `python qkv_test.py`
+- in order to test code in FlashAttentionForwardSm90, you need to run `python fwd_test.py`

@@ -28,8 +28,8 @@ def test_qkv():
         # k = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
         # v = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
         q = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype) * 3
-        k = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype) * 3
-        v = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype) * 3
+        k = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype) * 4
+        v = torch.ones(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype) * 5
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()

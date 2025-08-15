@@ -945,6 +945,28 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # if const_expr(self.num_stages > 1):
         #     load_K_next()
 
+@cute.jit
+def check_tensor_equality(tensor, expected_value, tile_idx=-1):
+    """Check if all elements in tensor equal expected_value, print ERROR if not."""
+    size = cute.size(tensor)
+    all_correct = True
+    first_error_idx = -1
+    for i in cutlass.range(size):
+        if tensor[i] != expected_value:
+            if first_error_idx == -1:
+                first_error_idx = i
+            all_correct = False
+    if all_correct:
+        if tile_idx >= 0:
+            cute.printf("SUCCESS: All {} elements are {} (tile_idx={})", size, expected_value, tile_idx)
+        else:
+            cute.printf("SUCCESS: All {} elements are {}", size, expected_value)
+    else:
+        if tile_idx >= 0:
+            cute.printf("check failed on iteration {} (tile_idx={})", first_error_idx, tile_idx)
+        else:
+            cute.printf("check failed on iteration {}", first_error_idx)
+
 class QKVForwardSm90:
 
     arch = 90
@@ -964,6 +986,17 @@ class QKVForwardSm90:
         mV: cute.Tensor,
         mO: cute.Tensor
     ):
+        
+        
+        # permute Q,K,V from B,H,N,D to N,D,B,H, required for TMA copying to work
+        # for unclear reasons if you are slicing a tensor before issuing a TMA copy on a slice
+        # you must index out the trailing dimensions - i.e.
+        # Q[None, None, batch_idx, head_idx] works, Q[batch_idx, head_idx, None, None] does not
+        # https://github.com/NVIDIA/cutlass/issues/2570
+        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[2,3,0,1]))
+        mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=[2,3,0,1]))
+        mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=[2,3,0,1]))
+        
         ##############################
         # make cute.TiledMma objects #
         ##############################
@@ -1062,27 +1095,14 @@ class QKVForwardSm90:
             cute.select(self.sV_layout, mode=[0,1]),
             (self.n_block_size, self.head_dim)
         )
-
-        print(f"tma_tensor_Q: {tma_tensor_Q}")
-        print(f"tma_tensor_K: {tma_tensor_K}")
-        print(f"tma_tensor_V: {tma_tensor_V}")
-
-        print(f"tma_atom_Q: {tma_atom_Q}")
-        print(f"tma_atom_K: {tma_atom_K}")
-        print(f"tma_atom_V: {tma_atom_V}")
-
-        print(f"sQ_layout: {self.sQ_layout}")
-        print(f"sK_layout: {cute.select(self.sK_layout, mode=[0,1])}")
-        print(f"sV_layout: {cute.select(self.sV_layout, mode=[0,1])}")
-
         
-        # Q,K,V are B,H,N,D
-        num_blocks_m = cute.ceil_div(cute.size(mQ.shape[2]), self.m_block_size)
-        num_heads = cute.size(mQ.shape[1])
-        num_batches = cute.size(mQ.shape[0])
-        seqlen_k = cute.size(mK.shape[2])
-        head_dim = cute.size(mQ.shape[3])
-        total_q = cute.size(mQ.shape[2])
+        # Q,K,V are now N,D,B,H after permutation
+        num_blocks_m = cute.ceil_div(cute.size(mQ.shape[0]), self.m_block_size)  # N dimension
+        num_heads = cute.size(mQ.shape[3])  # H dimension
+        num_batches = cute.size(mQ.shape[2])  # B dimension
+        seqlen_k = cute.size(mK.shape[0])  # N dimension for K
+        head_dim = cute.size(mQ.shape[1])  # D dimension
+        total_q = cute.size(mQ.shape[0])  # N dimension
         
         tile_scheduler_args = TileSchedulerArguments(
             num_block=num_blocks_m,
@@ -1098,13 +1118,13 @@ class QKVForwardSm90:
         grid_dim = SingleTileScheduler.get_grid_shape(tile_scheduler_params) # (Seq Len / BlockMDim, NumHeads, NumBatches)
         block_dim = (self.num_threads, 1, 1)
         smem_size = SharedStorage.size_in_bytes()
-        print(f"smem_size: {smem_size} out of 233472 bytes")
-        print(f"sequence length: {seqlen_k}")
-        print(f"head dim: {head_dim}")
-        print(f"grid dim: {grid_dim}")
-        print(f"num blocks m: {num_blocks_m}")
-        print(f"block dim: {block_dim}")
-        print(f"tma copy q bytes: {self.tma_copy_q_bytes}")
+        # print(f"smem_size: {smem_size} out of 233472 bytes")
+        # print(f"sequence length: {seqlen_k}")
+        # print(f"head dim: {head_dim}")
+        # print(f"grid dim: {grid_dim}")
+        # print(f"num blocks m: {num_blocks_m}")
+        # print(f"block dim: {block_dim}")
+        # print(f"tma copy q bytes: {self.tma_copy_q_bytes}")
 
         self.kernel(
             tma_tensor_Q, # tma tensor
@@ -1204,6 +1224,8 @@ class QKVForwardSm90:
 
         TileSchedulerCls = partial(SingleTileScheduler.create, tile_scheduler_params)
 
+        n_kv_blocks = cute.ceil_div(tma_tensor_K.shape[0], self.n_block_size)
+
         if is_producer:
             # TODO decrease registers
             self.producer(
@@ -1221,19 +1243,19 @@ class QKVForwardSm90:
                 pipeline_v,
                 TileSchedulerCls,
                 storage,
+                n_kv_blocks,
             )
         
         else:
             self.consumer(
                 mbar_ptr_Q,
                 sQ,
-                # tma_tensor_Q,
-                # tma_tensor_K,
-                # tma_tensor_V,
-                # tma_atom_K,
-                # tma_atom_V,
-                # pipeline_k,
-                # pipeline_v
+                pipeline_k,
+                pipeline_v,
+                sK,
+                sV,
+                n_kv_blocks,
+                tidx - 128,
             )
 
 
@@ -1253,6 +1275,7 @@ class QKVForwardSm90:
         pipeline_v: cutlass.pipeline.PipelineAsync,
         TileSchedulerCls: Callable,
         shared_storage: cutlass.Constexpr[Callable],
+        n_kv_blocks: int,
     ):
         block_idx_x, block_idx_y, block_idx_z = cute.arch.block_idx()
         thread_idx_x, _, _ = cute.arch.thread_idx()
@@ -1266,9 +1289,9 @@ class QKVForwardSm90:
             m_block, head_idx, batch_idx = work_tile.tile_idx
 
             # get this thread blocks's tile of Q, K, V
-            block_tma_Q = tma_Q[batch_idx, head_idx, None, None] # (N,D)
-            block_tma_K = tma_K[batch_idx, head_idx, None, None] # (N,D)
-            block_tma_V = tma_V[batch_idx, head_idx, None, None] # (N,D)
+            block_tma_Q = tma_Q[None, None, batch_idx, head_idx] # (N,D)
+            block_tma_K = tma_K[None, None, batch_idx, head_idx] # (N,D)
+            block_tma_V = tma_V[None, None, batch_idx, head_idx] # (N,D)
 
             #########################################################
             # partition TMA coordinates into tiles for K and V only #
@@ -1324,47 +1347,50 @@ class QKVForwardSm90:
             # load Q from global memory to shared memory #
             ##############################################
 
+            kv_producer_state = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.num_stages)
+
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_q_bytes)
             cute.copy(tma_atom_Q, tQgQ, tQsQ, tma_bar_ptr=mbar_ptr_Q)
 
             if block_idx_x == 0 and block_idx_y == 0 and block_idx_z == 0 and thread_idx_x == 0:
-                # cute.printf("tma copy atom Q: {}", str(tma_atom_Q))
-                # cute.printf("tma_copy_q_bytes: {}", self.tma_copy_q_bytes)
-                # cute.printf("tQgQ: {}", tQgQ.layout)
-                # cute.printf("tQsQ: {}", tQsQ)
-                # cute.printf("tma_Q: {}", tma_Q)
-                # cute.printf("tma_K: {}", tma_K)
-                # cute.printf("tma_V: {}", tma_V)
+                cute.printf("sK: {}", sK.layout)
+                cute.printf("sK_grouped: {}", sK_grouped.layout)
+                cute.printf("gK: {}", tiled_tma_K.layout)
+                cute.printf("gK_grouped: {}", tiled_tma_K_grouped.layout)
+                cute.printf("tKgK: {}", tKgK.layout)
+                cute.printf("tKsK: {}", tKsK.layout)
                 cute.printf("PRODUCER: copy initiated")
 
-            # n_blocks = cute.ceil_div(tma_Q.shape[2], self.n_block_size)
-            # for i in cutlass.range(n_blocks):
-            #     tma_K_tile = tma_K[batch_idx, head_idx, i * self.n_block_size:(i + 1) * self.n_block_size, None]
-            #     tma_V_tile = tma_V[batch_idx, head_idx, i * self.n_block_size:(i + 1) * self.n_block_size, None]
-            #     tiled_tma_K_tile = cute.local_tile(tma_K_tile, tiler=(self.n_block_size, self.head_dim), coord=(None, 0))
-            #     tiled_tma_V_tile = cute.local_tile(tma_V_tile, tiler=(self.n_block_size, self.head_dim), coord=(None, 0))
-            #     tiled_tma_K_tile_grouped = cute.group_modes(tiled_tma_K_tile, 0, 2)
-            #     tiled_tma_V_tile_grouped = cute.group_modes(tiled_tma_V_tile, 0, 2)
 
+            for tile_idx in cutlass.range(n_kv_blocks):
 
+                # wait on pipeline_k.sync_object_empty[kv_producer_state.index] with phase kv_producer_state.phase
+                # and then arrive on pipeline_k.sync_object_full[kv_producer_state.index]
+                pipeline_k.producer_acquire(kv_producer_state)
+                cute.copy(tma_atom_K, tKgK[None, tile_idx], tKsK[None, kv_producer_state.index], tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state))
 
-            # if block_idx_x == 0 and block_idx_y == 0 and block_idx_z == 0 and thread_idx_x == 0:
-            #     cute.printf("m block: %d, head idx: %d, batch idx: %d", m_block, head_idx, batch_idx)
-            #     cute.printf("tma_Q layout: {}", tma_Q.layout)
-            #     cute.printf("block_tma_Q layout: {}", block_tma_Q.layout)
-            #     cute.printf("tiled_tma_Q layout: {}", tiled_tma_Q.layout)
-            #     cute.printf("sQ layout: {}", sQ.layout)
-            #     cute.printf("sQ grouped layout: {}", sQ_grouped.layout)
-            #     cute.printf("tiled_tma_Q_grouped layout: {}", tiled_tma_Q_grouped.layout)
-            #     cute.printf("tQsQ layout: {}", tQsQ.layout)
-            #     cute.printf("tQgQ layout: {}", tQgQ.layout)
+                # wait on pipeline_v.sync_object_empty[kv_producer_state.index] with phase kv_producer_state.phase
+                # and then arrive on pipeline_v.sync_object_full[kv_producer_state.index]
+                pipeline_v.producer_acquire(kv_producer_state)
+                cute.copy(tma_atom_V, tVgV[None, tile_idx], tVsV[None, kv_producer_state.index], tma_bar_ptr=pipeline_v.producer_get_barrier(kv_producer_state))
+
+                # advance the pipeline state
+                kv_producer_state.advance()
 
 
     @cute.jit
     def consumer(self,
         mbar_ptr_Q: cute.Pointer,
         sQ: cute.Tensor,
+        pipeline_k: cutlass.pipeline.PipelineAsync,
+        pipeline_v: cutlass.pipeline.PipelineAsync,
+        # tiled_mma_qk: cute.TiledMma,
+        # tiled_mma_pv: cute.TiledMma,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        n_kv_blocks: int,
+        tidx: int,
         # tma_tensor_K: cute.Tensor,
         # tma_tensor_V: cute.Tensor,
         # tma_atom_K: cute.CopyAtom,
@@ -1372,25 +1398,53 @@ class QKVForwardSm90:
         # pipeline_k: cutlass.pipeline.PipelineAsync,
         # pipeline_v: cutlass.pipeline.PipelineAsync,
     ):
-        cute.arch.mbarrier_wait(mbar_ptr_Q, 0)
-        tidx, _, _ = cute.arch.thread_idx()
+        # tracks the index and phase of the consumer
         bidx, bidy, bidz = cute.arch.block_idx()
-        if tidx == 132 and bidx == 0 and bidy == 0 and bidz == 0:
-            cute.printf("CONSUMER: Q loaded")
-            # cute.printf("sQ layout: {}", sQ.layout)
-            cute.printf("sQ: {}", sQ[0])
-            cute.printf("sQ: {}", sQ[1])
-            cute.printf("sQ: {}", sQ[2])
-            cute.printf("sQ: {}", sQ[3])
-            cute.printf("sQ: {}", sQ[4])
-            cute.printf("sQ: {}", sQ[5])
-            cute.printf("sQ: {}", sQ[6])
-            cute.printf("sQ: {}", sQ[7])
-            # cute.print_tensor(sQ)
+        kv_consumer_state = pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, self.num_stages)
+        
+        warp_group_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        warp_group_thread_layout = cute.make_layout(self.num_mma_warp_groups, stride=128) # (128, 1)
 
-            # print first 10 elements of sQ
-            # sliced_data = cute.slice_(sQ, (0, None))
-            # cute.print_tensor(sliced_data)
+        # thr_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
+
+
+
+
+
+
+        # go from (BM, head_dim, num_stages) to ((BM, head_dim), num_stages)
+        sK = cute.group_modes(sK, 0, 2) # ((BM, head_dim), num_stages)
+        sV = cute.group_modes(sV, 0, 2) # ((BN, head_dim), num_stages)
+        
+        cute.arch.mbarrier_wait(mbar_ptr_Q, 0)
+
+        if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+            cute.printf("CONSUMER: Q loaded")
+            check_tensor_equality(sQ, cutlass.Float16(3.0))
+            # cute.printf("sQ: {}", sQ.layout)
+            # cute.printf("sK: {}", sK.layout)
+            # cute.printf("sV: {}", sV.layout)
+
+
+        for tile_idx in cutlass.range(n_kv_blocks):
+            pipeline_k.consumer_wait(kv_consumer_state)
+            pipeline_v.consumer_wait(kv_consumer_state)
+
+
+            if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+                cute.printf("CONSUMER: K and V loaded (tile_idx={}), kv_consumer_state.index={}", tile_idx, kv_consumer_state.index)
+                check_tensor_equality(sK[None, kv_consumer_state.index], cutlass.Float16(4.0), tile_idx)
+                check_tensor_equality(sV[None, kv_consumer_state.index], cutlass.Float16(5.0), tile_idx)
+            
+            pipeline_k.consumer_release(kv_consumer_state)
+            pipeline_v.consumer_release(kv_consumer_state)
+
+            kv_consumer_state.advance()
+        
+        
+
+
+
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
@@ -1913,20 +1967,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         gQ_grouped,
                     )
 
-                    if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
-                        cute.printf("gQ: {}", gQ.layout)
-                        cute.printf("gQ_grouped: {}", gQ_grouped.layout)
-                        cute.printf("sQ: {}", sQ.layout)
-                        cute.printf("sQ_grouped: {}", sQ_grouped.layout)
-                        cute.printf("tQgQ: {}", tQgQ.layout)
-                
+                    # if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+                    #     cute.printf("gQ: {}", gQ.layout)
+                    #     cute.printf("gQ_grouped: {}", gQ_grouped.layout)
+                    #     cute.printf("sQ: {}", sQ.layout)
+                    #     cute.printf("sQ_grouped: {}", sQ_grouped.layout)
+                    #     cute.printf("tQgQ: {}", tQgQ.layout)
+                sK_grouped = cute.group_modes(sK, 0, 2)
+                gK_grouped = cute.group_modes(gK, 0, 2)
                 
                 tKsK, tKgK = cpasync.tma_partition(
                     tma_atom_K,
                     0,
                     cute.make_layout(1),
-                    cute.group_modes(sK, 0, 2),
-                    cute.group_modes(gK, 0, 2),
+                    sK_grouped,
+                    gK_grouped,
                 )
                 tVsV, tVgV = cpasync.tma_partition(
                     tma_atom_V,
@@ -1937,6 +1992,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
                 load_K = partial(self.load_K, tma_atom_K, tKgK, tKsK, pipeline_k)
                 load_V = partial(self.load_K, tma_atom_V, tVgV, tVsV, pipeline_v)
+
+                if tidx == 0 and bidx == 0 and bidy == 0 and bidz == 0:
+                    # cute.printf("tQgQ: {}", tQgQ.layout)
+                    # cute.printf("tQsQ: {}", tQsQ.layout)
+                    cute.printf("sK: {}", sK.layout)
+                    cute.printf("sK_grouped: {}", sK_grouped.layout)
+                    cute.printf("gK: {}", gK.layout)
+                    cute.printf("gK_grouped: {}", gK_grouped.layout)
+                    cute.printf("tKgK: {}", tKgK.layout)
+                    cute.printf("tKsK: {}", tKsK.layout)
+                    # cute.printf("tVgV: {}", tVgV.layout)
+                    # cute.printf("tVsV: {}", tVsV.layout)
                 
                 # load_Q
                 if const_expr(not self.pack_gqa):
