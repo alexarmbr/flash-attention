@@ -22,6 +22,8 @@ class Softmax:
         self.row_max = cute.make_fragment(num_rows, Float32)
         self.row_sum = cute.make_fragment_like(self.row_max)
         self.arch = arch
+        self.tidx, _, _ = cute.arch.thread_idx()
+        self.bidx, self.bidy, self.bidz = cute.arch.block_idx()
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
@@ -81,6 +83,11 @@ class Softmax:
             self.row_max[r] = row_max_cur
             self.row_sum[r] = acc_S_row_sum
             acc_S_mn[r, None].store(acc_S_row_exp)
+
+            if self.tidx == 128 and self.bidx == 0 and self.bidy == 0 and self.bidz == 0 and is_first:
+                cute.printf("self.row_max: {}", self.row_max.layout)
+                cute.printf("self.row_sum: {}", self.row_sum.layout)
+
         return row_scale
 
     @cute.jit
