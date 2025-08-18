@@ -2111,6 +2111,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
+        
+        
         while work_tile.is_valid_tile:
         # if work_tile.is_valid_tile:
             # Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
@@ -2182,7 +2184,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # than 128 x 128, i.e. it calls convert on 1 fp32 element at a time instead of
                 # 2 elements. So we just call ptx directly.
                 utils.cvt_f16(tOrP_acc, tOrP)
-                if const_expr(not self.mma_pv_is_rs):
+                if const_expr(not self.mma_pv_is_rs): # write tile of P to smem
                     tPrP = smem_thr_copy_P.retile(tOrP)
                     cute.copy(smem_thr_copy_P, tPrP, tPsP)
                     # Fence and barrier to make sure smem store is visible to WGMMA
@@ -2267,7 +2269,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def mma_one_n_block(
         self,
         n_block: cutlass.Int32,
-        smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple, # kv consumer state
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tiled_mma_pv_rs: cute.TiledMma,
@@ -2282,27 +2284,52 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         check_inf: cutlass.Constexpr = True,
         O_should_accumulate: cutlass.Boolean = True,
     ):
+
+        # TODO: why do warpgroups signal 2 warpgroups ahead?
+        # TODO: what sort of race condition would happen in this function if you removed
+        # the warp_scheduler_barrier_sync() call between the mmas
+        # TODO: benchmark with self.mma_pv_is_rs = True/False
+        # TODO: benchmark with self.intra_wg_overlap = True/False
+        
+        # make an fp32 accumulator that is going to hold a tile of the output of the qk matmul
         acc_S = cute.make_fragment(
             tiled_mma_qk.partition_shape_C((self.m_block_size, self.n_block_size)), cutlass.Float32
         )
+        
+        # wait for tile of K to be ready
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+        
+        # run Q * K^T
         sm90_utils.gemm(
             tiled_mma_qk, acc_S, mma_params.tSrQ,
             mma_params.tSrK[None, None, None, smem_pipe_read.index],
             zero_init=True, wg_wait=-1
         )
+        
+        # arrive at a barrier
         self.warp_scheduler_barrier_arrive()
+        
+        # TODO is this waiting for the mma to finish?
         warpgroup.wait_group(0)
+        
+        # release the memory used to store this tile of K so that it can be written to again
         pipeline_k.consumer_release(smem_pipe_read)
+        
         scoremod_premask_fn(acc_S)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
+        
+        # compute the softmax
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
+        
+        
         tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
         tOrP = mma_params.tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
         # tOrP.store(tOrP_acc.load().to(self.dtype))
         utils.cvt_f16(tOrP_acc, tOrP)
+        
+        # store to smem
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(mma_params.tOrP)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
@@ -2311,13 +2338,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+        
+        # wait for tile of V to be ready
         pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
+        
+        # sync with another warpgroup
         self.warp_scheduler_barrier_sync()
         sm90_utils.gemm(
             tiled_mma_pv, mma_params.acc_O, mma_params.tOrP,
             mma_params.tOrVt[None, None, None, smem_pipe_read.index],
             zero_init=not O_should_accumulate, wg_wait=0
         )
+        
+        # release the memory used to store this tile of V so that it can be written to again
         pipeline_v.consumer_release(smem_pipe_read)
         smem_pipe_read.advance()
         return smem_pipe_read
@@ -2326,7 +2359,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def mma_one_n_block_intrawg_overlap(
         self,
         n_block: cutlass.Int32,
-        smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple, # kv consumer state
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tiled_mma_pv_rs: cute.TiledMma,
@@ -2340,6 +2373,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         check_inf: cutlass.Constexpr = True,
         O_should_accumulate: cutlass.Boolean = True,
     ):
+        
+        # TODO how are the stages of K and V kept track of? What happens in the prologue?
+        # in this case we already performed Q * K^T on the first tile of K in the prologue
         smem_pipe_read_v = smem_pipe_read.clone()
         smem_pipe_read.advance()
         acc_S = cute.make_fragment(
@@ -2394,6 +2430,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
 
     def warp_scheduler_barrier_sync(self):
+        
+        # mma wg 1 waits on barrier 1
+        # mma wg 2 waits on barrier 2
+        # mma wg 3 waits on barrier 3
+        
         if const_expr(self.use_scheduler_barrier):
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) - 1 + utils.canonical_warp_group_idx(sync=False),
@@ -2401,10 +2442,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
 
     def warp_scheduler_barrier_arrive(self):
+
+        # self.num_mma_warp_groups = is determined by the size of the qk mma
         if const_expr(self.use_scheduler_barrier):
             assert self.num_mma_warp_groups in [2, 3]
             cur_wg = utils.canonical_warp_group_idx(sync=False) - 1
+            # cur_wg = 0,1 or 2, wg index within the consumer warp groups
+
             next_wg = 1 - cur_wg if const_expr(self.num_mma_warp_groups == 2) else (cur_wg + 1 if cur_wg < self.num_mma_warp_groups - 1 else 0)
+            # if num_mma_warp_groups = 2:
+            #   cur_wg =  0, 1
+            #   next_wg = 1, 0
+            #
+            # if num_mma_warp_groups = 3:
+            #   cur_wg =  0, 1, 2
+            #   next_wg = 1, 2, 0
+            #   signals = 2, 3, 0
+            
             cute.arch.barrier_arrive(
                 barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + next_wg,
                 number_of_threads=2 * self.num_threads_per_warp_group,
